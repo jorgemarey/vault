@@ -1,0 +1,569 @@
+diff --git a/builtin/logical/consul/backend.go b/builtin/logical/consul/backend.go
+index 52aeb3cbce..2049be9081 100644
+--- a/builtin/logical/consul/backend.go
++++ b/builtin/logical/consul/backend.go
+@@ -37,6 +37,10 @@ func Backend() *backend {
+ 			pathListRoles(&b),
+ 			pathRoles(&b),
+ 			pathToken(&b),
++			pathKeyring(&b),
++			pathKeyringReload(&b),
++			pathKeyringRotate(&b),
++			pathTokenByAccessor(&b),
+ 		},
+ 
+ 		Secrets: []*framework.Secret{
+diff --git a/builtin/logical/consul/path_roles.go b/builtin/logical/consul/path_roles.go
+index 1341544ea3..b8be405f2e 100644
+--- a/builtin/logical/consul/path_roles.go
++++ b/builtin/logical/consul/path_roles.go
+@@ -5,8 +5,6 @@ package consul
+ 
+ import (
+ 	"context"
+-	"encoding/base64"
+-	"fmt"
+ 	"time"
+ 
+ 	"github.com/hashicorp/vault/sdk/framework"
+@@ -43,24 +41,6 @@ func pathRoles(b *backend) *framework.Path {
+ 				Description: "Name of the role.",
+ 			},
+ 
+-			// The "policy" and "token_type" parameters were deprecated in Consul back in version 1.4.
+-			// They have been removed from Consul as of version 1.11. Consider removing them here in the future.
+-			"policy": {
+-				Type: framework.TypeString,
+-				Description: `Policy document, base64 encoded. Required
+-for 'client' tokens. Required for Consul pre-1.4.`,
+-				Deprecated: true,
+-			},
+-
+-			"token_type": {
+-				Type:    framework.TypeString,
+-				Default: "client",
+-				Description: `Which type of token to create: 'client' or 'management'. If
+-a 'management' token, the "policy", "policies", and "consul_roles" parameters are not
+-required. Defaults to 'client'.`,
+-				Deprecated: true,
+-			},
+-
+ 			"policies": {
+ 				Type:        framework.TypeCommaStringSlice,
+ 				Description: `Use "consul_policies" instead.`,
+@@ -80,6 +60,15 @@ using Consul 1.4.`,
+ or "consul_roles" are required for Consul 1.5 and above.`,
+ 			},
+ 
++			"policies_from_entity_metadata": {
++				Type:        framework.TypeString,
++				Description: "Metadata value from which to get the policies",
++			},
++			"allowed_node_identity_prefix": {
++				Type:        framework.TypeStringSlice,
++				Description: `List of prefix node identities allowed`,
++			},
++
+ 			"local": {
+ 				Type: framework.TypeBool,
+ 				Description: `Indicates that the token should not be replicated globally 
+@@ -160,25 +149,20 @@ func (b *backend) pathRolesRead(ctx context.Context, req *logical.Request, d *fr
+ 		return nil, err
+ 	}
+ 
+-	if roleConfigData.TokenType == "" {
+-		roleConfigData.TokenType = "client"
+-	}
+-
+ 	// Generate the response
+ 	resp := &logical.Response{
+ 		Data: map[string]interface{}{
+ 			"lease":            int64(roleConfigData.TTL.Seconds()),
+ 			"ttl":              int64(roleConfigData.TTL.Seconds()),
+ 			"max_ttl":          int64(roleConfigData.MaxTTL.Seconds()),
+-			"token_type":       roleConfigData.TokenType,
+ 			"local":            roleConfigData.Local,
+ 			"consul_namespace": roleConfigData.ConsulNamespace,
+ 			"partition":        roleConfigData.Partition,
++
++			"policies_from_entity_metadata": roleConfigData.PoliciesFromEntityMetadata,
++			"allowed_node_identity_prefix":  roleConfigData.AllowedNodeIdentityPrefix,
+ 		},
+ 	}
+-	if roleConfigData.Policy != "" {
+-		resp.Data["policy"] = base64.StdEncoding.EncodeToString([]byte(roleConfigData.Policy))
+-	}
+ 	if len(roleConfigData.Policies) > 0 {
+ 		resp.Data["consul_policies"] = roleConfigData.Policies
+ 	}
+@@ -196,36 +180,21 @@ func (b *backend) pathRolesRead(ctx context.Context, req *logical.Request, d *fr
+ }
+ 
+ func (b *backend) pathRolesWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+-	tokenType := d.Get("token_type").(string)
+-	policy := d.Get("policy").(string)
+ 	consulPolicies := d.Get("consul_policies").([]string)
+ 	policies := d.Get("policies").([]string)
+ 	roles := d.Get("consul_roles").([]string)
+ 	serviceIdentities := d.Get("service_identities").([]string)
+ 	nodeIdentities := d.Get("node_identities").([]string)
+ 
+-	switch tokenType {
+-	case "client":
+-		if policy == "" && len(policies) == 0 && len(consulPolicies) == 0 &&
+-			len(roles) == 0 && len(serviceIdentities) == 0 && len(nodeIdentities) == 0 {
+-			return logical.ErrorResponse(
+-				"Use either a policy document, a list of policies or roles, or a set of service or node identities, depending on your Consul version"), nil
+-		}
+-	case "management":
+-	default:
+-		return logical.ErrorResponse("token_type must be \"client\" or \"management\""), nil
++	if len(policies) == 0 && len(consulPolicies) == 0 &&
++		len(roles) == 0 && len(serviceIdentities) == 0 && len(nodeIdentities) == 0 {
++		return logical.ErrorResponse("Use either a list of policies or roles, or a set of service or node identities, depending on your Consul version"), nil
+ 	}
+ 
+ 	if len(consulPolicies) == 0 {
+ 		consulPolicies = policies
+ 	}
+ 
+-	policyRaw, err := base64.StdEncoding.DecodeString(policy)
+-	if err != nil {
+-		return logical.ErrorResponse(fmt.Sprintf(
+-			"Error decoding policy base64: %s", err)), nil
+-	}
+-
+ 	var ttl time.Duration
+ 	ttlRaw, ok := d.GetOk("ttl")
+ 	if ok {
+@@ -243,22 +212,35 @@ func (b *backend) pathRolesWrite(ctx context.Context, req *logical.Request, d *f
+ 		maxTTL = time.Second * time.Duration(maxTTLRaw.(int))
+ 	}
+ 
++	var policiesFromEntity string
++	policiesFromEntityRaw, ok := d.GetOk("policies_from_entity_metadata")
++	if ok {
++		policiesFromEntity = policiesFromEntityRaw.(string)
++	}
++
++	var allowedNodeIdentities []string
++	allowedNodeIdentitiesRaw, ok := d.GetOk("allowed_node_identity_prefix")
++	if ok {
++		allowedNodeIdentities = allowedNodeIdentitiesRaw.([]string)
++	}
++
+ 	name := d.Get("name").(string)
+ 	local := d.Get("local").(bool)
+ 	namespace := d.Get("consul_namespace").(string)
+ 	partition := d.Get("partition").(string)
+ 	entry, err := logical.StorageEntryJSON("policy/"+name, roleConfig{
+-		Policy:            string(policyRaw),
+ 		Policies:          consulPolicies,
+ 		ConsulRoles:       roles,
+ 		ServiceIdentities: serviceIdentities,
+ 		NodeIdentities:    nodeIdentities,
+-		TokenType:         tokenType,
+ 		TTL:               ttl,
+ 		MaxTTL:            maxTTL,
+ 		Local:             local,
+ 		ConsulNamespace:   namespace,
+ 		Partition:         partition,
++
++		PoliciesFromEntityMetadata: policiesFromEntity,
++		AllowedNodeIdentityPrefix:  allowedNodeIdentities,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+@@ -280,15 +262,16 @@ func (b *backend) pathRolesDelete(ctx context.Context, req *logical.Request, d *
+ }
+ 
+ type roleConfig struct {
+-	Policy            string        `json:"policy"`
+ 	Policies          []string      `json:"policies"`
+ 	ConsulRoles       []string      `json:"consul_roles"`
+ 	ServiceIdentities []string      `json:"service_identities"`
+ 	NodeIdentities    []string      `json:"node_identities"`
+ 	TTL               time.Duration `json:"lease"`
+ 	MaxTTL            time.Duration `json:"max_ttl"`
+-	TokenType         string        `json:"token_type"`
+ 	Local             bool          `json:"local"`
+ 	ConsulNamespace   string        `json:"consul_namespace"`
+ 	Partition         string        `json:"partition"`
++
++	PoliciesFromEntityMetadata string   `json:"policies_from_entity_metadata"`
++	AllowedNodeIdentityPrefix  []string `json:"allowed_node_identity_prefix"`
+ }
+diff --git a/builtin/logical/consul/path_token.go b/builtin/logical/consul/path_token.go
+index 6cddd1fddc..8c5e3c07df 100644
+--- a/builtin/logical/consul/path_token.go
++++ b/builtin/logical/consul/path_token.go
+@@ -33,6 +33,10 @@ func pathToken(b *backend) *framework.Path {
+ 				Type:        framework.TypeString,
+ 				Description: "Name of the role.",
+ 			},
++			"node_identity": {
++				Type:        framework.TypeString,
++				Description: "Node identity to use",
++			},
+ 		},
+ 
+ 		Callbacks: map[logical.Operation]framework.OperationFunc{
+@@ -43,6 +47,7 @@ func pathToken(b *backend) *framework.Path {
+ 
+ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+ 	role := d.Get("role").(string)
++	nodeIdentity := d.Get("node_identity").(string)
+ 	entry, err := req.Storage.Get(ctx, "policy/"+role)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error retrieving role: %w", err)
+@@ -56,10 +61,6 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
+ 		return nil, err
+ 	}
+ 
+-	if roleConfigData.TokenType == "" {
+-		roleConfigData.TokenType = "client"
+-	}
+-
+ 	// Get the consul client
+ 	c, userErr, intErr := b.client(ctx, req.Storage)
+ 	if intErr != nil {
+@@ -75,30 +76,6 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
+ 	writeOpts := &api.WriteOptions{}
+ 	writeOpts = writeOpts.WithContext(ctx)
+ 
+-	// Create an ACLEntry for Consul pre 1.4
+-	if (roleConfigData.Policy != "" && roleConfigData.TokenType == "client") ||
+-		(roleConfigData.Policy == "" && roleConfigData.TokenType == "management") {
+-		token, _, err := c.ACL().Create(&api.ACLEntry{
+-			Name:  tokenName,
+-			Type:  roleConfigData.TokenType,
+-			Rules: roleConfigData.Policy,
+-		}, writeOpts)
+-		if err != nil {
+-			return logical.ErrorResponse(err.Error()), nil
+-		}
+-
+-		// Use the helper to create the secret
+-		s := b.Secret(SecretTokenType).Response(map[string]interface{}{
+-			"token": token,
+-		}, map[string]interface{}{
+-			"token": token,
+-			"role":  role,
+-		})
+-		s.Secret.TTL = roleConfigData.TTL
+-		s.Secret.MaxTTL = roleConfigData.MaxTTL
+-		return s, nil
+-	}
+-
+ 	// Create an ACLToken for Consul 1.4 and above
+ 	policyLinks := []*api.ACLTokenPolicyLink{}
+ 	for _, policyName := range roleConfigData.Policies {
+@@ -114,8 +91,34 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
+ 		})
+ 	}
+ 
++	if roleConfigData.PoliciesFromEntityMetadata != "" && req.EntityID != "" {
++		if policies, err := getEntityPolicies(roleConfigData.PoliciesFromEntityMetadata, req.EntityID, b.System()); err == nil {
++			for _, policyName := range policies {
++				policyLinks = append(policyLinks, &api.ACLTokenPolicyLink{
++					Name: policyName,
++				})
++			}
++		}
++	}
++
++	nodeIdentities := roleConfigData.NodeIdentities
++	if nodeIdentity != "" {
++		var addIdentity bool
++		for _, prefix := range roleConfigData.AllowedNodeIdentityPrefix {
++			if strings.HasPrefix(nodeIdentity, prefix) || prefix == "*" {
++				addIdentity = true
++				break
++			}
++		}
++		if addIdentity {
++			nodeIdentities = append(nodeIdentities, nodeIdentity)
++		} else {
++			return logical.ErrorResponse(fmt.Sprintf("node_identity %s is not allowed", nodeIdentity)), nil
++		}
++	}
++
+ 	aclServiceIdentities := parseServiceIdentities(roleConfigData.ServiceIdentities)
+-	aclNodeIdentities := parseNodeIdentities(roleConfigData.NodeIdentities)
++	aclNodeIdentities := parseNodeIdentities(nodeIdentities)
+ 
+ 	token, _, err := c.ACL().TokenCreate(&api.ACLToken{
+ 		Description:       tokenName,
+@@ -180,3 +183,95 @@ func parseNodeIdentities(data []string) []*api.ACLNodeIdentity {
+ 
+ 	return aclNodeIdentities
+ }
++
++func getEntityPolicies(metadata, entityID string, sysView logical.SystemView) ([]string, error) {
++	entity, err := sysView.EntityInfo(entityID)
++	if err != nil {
++		return nil, err
++	}
++	if entity == nil {
++		return nil, fmt.Errorf("no entity found")
++	}
++
++	groups, err := sysView.GroupsForEntity(entityID)
++	if err != nil {
++		return nil, err
++	}
++
++	mapPolicies := make(map[string]struct{})
++
++	if value, ok := entity.Metadata[metadata]; ok {
++		for _, gp := range strings.Split(value, ",") {
++			mapPolicies[gp] = struct{}{}
++		}
++	}
++
++	for _, g := range groups {
++		if value, ok := g.Metadata[metadata]; ok {
++			for _, gp := range strings.Split(value, ",") {
++				mapPolicies[gp] = struct{}{}
++			}
++		}
++	}
++
++	policies := make([]string, 0, len(mapPolicies))
++	for policy := range mapPolicies {
++		policies = append(policies, policy)
++	}
++	return policies, nil
++}
++
++func pathTokenByAccessor(b *backend) *framework.Path {
++	return &framework.Path{
++		Pattern: "token/" + framework.GenericNameRegex("accessor"),
++
++		DisplayAttrs: &framework.DisplayAttributes{
++			OperationPrefix: operationPrefixConsul,
++			OperationVerb:   "read",
++			OperationSuffix: "token",
++		},
++
++		Fields: map[string]*framework.FieldSchema{
++			"accessor": {
++				Type:        framework.TypeString,
++				Description: "Accessor ID",
++			},
++		},
++
++		Callbacks: map[logical.Operation]framework.OperationFunc{
++			logical.ReadOperation: b.pathTokenByAccessorRead,
++		},
++	}
++}
++
++func (b *backend) pathTokenByAccessorRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
++	accessor := d.Get("accessor").(string)
++
++	// Get the consul client
++	c, userErr, intErr := b.client(ctx, req.Storage)
++	if intErr != nil {
++		return nil, intErr
++	}
++	if userErr != nil {
++		return logical.ErrorResponse(userErr.Error()), nil
++	}
++
++	opts := &api.QueryOptions{}
++	opts = opts.WithContext(ctx)
++
++	token, _, err := c.ACL().TokenRead(accessor, opts)
++	if err != nil {
++		return logical.ErrorResponse(err.Error()), nil
++	}
++
++	resp := &logical.Response{
++		Data: map[string]interface{}{
++			"token":            token.SecretID,
++			"accessor":         token.AccessorID,
++			"local":            token.Local,
++			"consul_namespace": token.Namespace,
++			"partition":        token.Partition,
++		},
++	}
++	return resp, nil
++}
+diff --git a/builtin/logical/nomad/backend.go b/builtin/logical/nomad/backend.go
+index 4c7e149185..72d6385422 100644
+--- a/builtin/logical/nomad/backend.go
++++ b/builtin/logical/nomad/backend.go
+@@ -38,6 +38,9 @@ func Backend() *backend {
+ 			pathListRoles(&b),
+ 			pathRoles(&b),
+ 			pathCredsCreate(&b),
++			pathKeyring(&b),
++			pathKeyringReload(&b),
++			pathKeyringRotate(&b),
+ 		},
+ 
+ 		Secrets: []*framework.Secret{
+@@ -53,12 +56,15 @@ type backend struct {
+ 	*framework.Backend
+ }
+ 
+-func clientFromConfig(conf *accessConfig) (*api.Client, error) {
++func clientFromConfig(conf *accessConfig, addr string) (*api.Client, error) {
+ 	nomadConf := api.DefaultConfig()
+ 	if conf != nil {
+ 		if conf.Address != "" {
+ 			nomadConf.Address = conf.Address
+ 		}
++		if addr != "" {
++			nomadConf.Address = addr
++		}
+ 		if conf.Token != "" {
+ 			nomadConf.SecretID = conf.Token
+ 		}
+@@ -81,5 +87,14 @@ func (b *backend) client(ctx context.Context, s logical.Storage) (*api.Client, e
+ 		return nil, err
+ 	}
+ 
+-	return clientFromConfig(conf)
++	return clientFromConfig(conf, "")
++}
++
++func (b *backend) clientWithAddr(ctx context.Context, s logical.Storage, addr string) (*api.Client, error) {
++	conf, err := b.readConfigAccess(ctx, s)
++	if err != nil {
++		return nil, err
++	}
++
++	return clientFromConfig(conf, addr)
+ }
+diff --git a/builtin/logical/nomad/path_config_access.go b/builtin/logical/nomad/path_config_access.go
+index cde6f97edb..3ee511a0c8 100644
+--- a/builtin/logical/nomad/path_config_access.go
++++ b/builtin/logical/nomad/path_config_access.go
+@@ -164,7 +164,7 @@ func (b *backend) pathConfigAccessWrite(ctx context.Context, req *logical.Reques
+ 	}
+ 
+ 	if conf.Token == "" {
+-		client, err := clientFromConfig(conf)
++		client, err := clientFromConfig(conf, "")
+ 		if err != nil {
+ 			return logical.ErrorResponse("Token not provided and failed to constuct client"), err
+ 		}
+diff --git a/builtin/logical/nomad/path_creds_create.go b/builtin/logical/nomad/path_creds_create.go
+index 9c25bed07d..4f0e34acb3 100644
+--- a/builtin/logical/nomad/path_creds_create.go
++++ b/builtin/logical/nomad/path_creds_create.go
+@@ -6,6 +6,7 @@ package nomad
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/hashicorp/nomad/api"
+@@ -82,11 +83,18 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
+ 		tokenName = tokenName[:tokenNameLength]
+ 	}
+ 
++	policies := role.Policies
++	if role.PoliciesFromEntityMetadata != "" && req.EntityID != "" {
++		if p, err := getEntityPolicies(role.PoliciesFromEntityMetadata, req.EntityID, b.System()); err == nil {
++			policies = append(policies, p...)
++		}
++	}
++
+ 	// Create it
+ 	token, _, err := c.ACLTokens().Create(&api.ACLToken{
+ 		Name:     tokenName,
+ 		Type:     role.TokenType,
+-		Policies: role.Policies,
++		Policies: policies,
+ 		Global:   role.Global,
+ 	}, nil)
+ 	if err != nil {
+@@ -105,3 +113,40 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
+ 
+ 	return resp, nil
+ }
++
++func getEntityPolicies(metadata, entityID string, sysView logical.SystemView) ([]string, error) {
++	entity, err := sysView.EntityInfo(entityID)
++	if err != nil {
++		return nil, err
++	}
++	if entity == nil {
++		return nil, fmt.Errorf("no entity found")
++	}
++
++	groups, err := sysView.GroupsForEntity(entityID)
++	if err != nil {
++		return nil, err
++	}
++
++	mapPolicies := make(map[string]struct{})
++
++	if value, ok := entity.Metadata[metadata]; ok {
++		for _, gp := range strings.Split(value, ",") {
++			mapPolicies[gp] = struct{}{}
++		}
++	}
++
++	for _, g := range groups {
++		if value, ok := g.Metadata[metadata]; ok {
++			for _, gp := range strings.Split(value, ",") {
++				mapPolicies[gp] = struct{}{}
++			}
++		}
++	}
++
++	policies := make([]string, 0, len(mapPolicies))
++	for policy := range mapPolicies {
++		policies = append(policies, policy)
++	}
++	return policies, nil
++}
+diff --git a/builtin/logical/nomad/path_roles.go b/builtin/logical/nomad/path_roles.go
+index 4732dec5b8..351eb75d26 100644
+--- a/builtin/logical/nomad/path_roles.go
++++ b/builtin/logical/nomad/path_roles.go
+@@ -42,6 +42,11 @@ func pathRoles(b *backend) *framework.Path {
+ 				Description: "Name of the role",
+ 			},
+ 
++			"policies_from_entity_metadata": {
++				Type:        framework.TypeString,
++				Description: "Metadata value from which to get the policies",
++			},
++
+ 			"policies": {
+ 				Type:        framework.TypeCommaStringSlice,
+ 				Description: "Comma-separated string or list of policies as previously created in Nomad. Required for 'client' token.",
+@@ -130,6 +135,8 @@ func (b *backend) pathRolesRead(ctx context.Context, req *logical.Request, d *fr
+ 			"type":     role.TokenType,
+ 			"global":   role.Global,
+ 			"policies": role.Policies,
++
++			"policies_from_entity_metadata": role.PoliciesFromEntityMetadata,
+ 		},
+ 	}
+ 	return resp, nil
+@@ -151,6 +158,11 @@ func (b *backend) pathRolesWrite(ctx context.Context, req *logical.Request, d *f
+ 		role.Policies = policies.([]string)
+ 	}
+ 
++	policiesFromEntity, ok := d.GetOk("policies_from_entity_metadata")
++	if ok {
++		role.PoliciesFromEntityMetadata = policiesFromEntity.(string)
++	}
++
+ 	role.TokenType = d.Get("type").(string)
+ 	switch role.TokenType {
+ 	case "client":
+@@ -197,4 +209,6 @@ type roleConfig struct {
+ 	Policies  []string `json:"policies"`
+ 	TokenType string   `json:"type"`
+ 	Global    bool     `json:"global"`
++
++	PoliciesFromEntityMetadata string `json:"policies_from_entity_metadata"`
+ }

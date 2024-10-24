@@ -38,6 +38,9 @@ func Backend() *backend {
 			pathListRoles(&b),
 			pathRoles(&b),
 			pathCredsCreate(&b),
+			pathKeyring(&b),
+			pathKeyringReload(&b),
+			pathKeyringRotate(&b),
 		},
 
 		Secrets: []*framework.Secret{
@@ -53,11 +56,14 @@ type backend struct {
 	*framework.Backend
 }
 
-func clientFromConfig(conf *accessConfig) (*api.Client, error) {
+func clientFromConfig(conf *accessConfig, addr string) (*api.Client, error) {
 	nomadConf := api.DefaultConfig()
 	if conf != nil {
 		if conf.Address != "" {
 			nomadConf.Address = conf.Address
+		}
+		if addr != "" {
+			nomadConf.Address = addr
 		}
 		if conf.Token != "" {
 			nomadConf.SecretID = conf.Token
@@ -81,5 +87,14 @@ func (b *backend) client(ctx context.Context, s logical.Storage) (*api.Client, e
 		return nil, err
 	}
 
-	return clientFromConfig(conf)
+	return clientFromConfig(conf, "")
+}
+
+func (b *backend) clientWithAddr(ctx context.Context, s logical.Storage, addr string) (*api.Client, error) {
+	conf, err := b.readConfigAccess(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientFromConfig(conf, addr)
 }

@@ -33,6 +33,10 @@ func pathToken(b *backend) *framework.Path {
 				Type:        framework.TypeString,
 				Description: "Name of the role.",
 			},
+			"node_identity": {
+				Type:        framework.TypeString,
+				Description: "Node identity to use",
+			},
 		},
 
 		Callbacks: map[logical.Operation]framework.OperationFunc{
@@ -43,6 +47,7 @@ func pathToken(b *backend) *framework.Path {
 
 func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	role := d.Get("role").(string)
+	nodeIdentity := d.Get("node_identity").(string)
 	entry, err := req.Storage.Get(ctx, "policy/"+role)
 	if err != nil {
 		return nil, fmt.Errorf("error retrieving role: %w", err)
@@ -54,10 +59,6 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 	var roleConfigData roleConfig
 	if err := entry.DecodeJSON(&roleConfigData); err != nil {
 		return nil, err
-	}
-
-	if roleConfigData.TokenType == "" {
-		roleConfigData.TokenType = "client"
 	}
 
 	// Get the consul client
@@ -75,30 +76,6 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 	writeOpts := &api.WriteOptions{}
 	writeOpts = writeOpts.WithContext(ctx)
 
-	// Create an ACLEntry for Consul pre 1.4
-	if (roleConfigData.Policy != "" && roleConfigData.TokenType == "client") ||
-		(roleConfigData.Policy == "" && roleConfigData.TokenType == "management") {
-		token, _, err := c.ACL().Create(&api.ACLEntry{
-			Name:  tokenName,
-			Type:  roleConfigData.TokenType,
-			Rules: roleConfigData.Policy,
-		}, writeOpts)
-		if err != nil {
-			return logical.ErrorResponse(err.Error()), nil
-		}
-
-		// Use the helper to create the secret
-		s := b.Secret(SecretTokenType).Response(map[string]interface{}{
-			"token": token,
-		}, map[string]interface{}{
-			"token": token,
-			"role":  role,
-		})
-		s.Secret.TTL = roleConfigData.TTL
-		s.Secret.MaxTTL = roleConfigData.MaxTTL
-		return s, nil
-	}
-
 	// Create an ACLToken for Consul 1.4 and above
 	policyLinks := []*api.ACLTokenPolicyLink{}
 	for _, policyName := range roleConfigData.Policies {
@@ -114,8 +91,34 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 		})
 	}
 
+	if roleConfigData.PoliciesFromEntityMetadata != "" && req.EntityID != "" {
+		if policies, err := getEntityPolicies(roleConfigData.PoliciesFromEntityMetadata, req.EntityID, b.System()); err == nil {
+			for _, policyName := range policies {
+				policyLinks = append(policyLinks, &api.ACLTokenPolicyLink{
+					Name: policyName,
+				})
+			}
+		}
+	}
+
+	nodeIdentities := roleConfigData.NodeIdentities
+	if nodeIdentity != "" {
+		var addIdentity bool
+		for _, prefix := range roleConfigData.AllowedNodeIdentityPrefix {
+			if strings.HasPrefix(nodeIdentity, prefix) || prefix == "*" {
+				addIdentity = true
+				break
+			}
+		}
+		if addIdentity {
+			nodeIdentities = append(nodeIdentities, nodeIdentity)
+		} else {
+			return logical.ErrorResponse(fmt.Sprintf("node_identity %s is not allowed", nodeIdentity)), nil
+		}
+	}
+
 	aclServiceIdentities := parseServiceIdentities(roleConfigData.ServiceIdentities)
-	aclNodeIdentities := parseNodeIdentities(roleConfigData.NodeIdentities)
+	aclNodeIdentities := parseNodeIdentities(nodeIdentities)
 
 	token, _, err := c.ACL().TokenCreate(&api.ACLToken{
 		Description:       tokenName,
@@ -179,4 +182,96 @@ func parseNodeIdentities(data []string) []*api.ACLNodeIdentity {
 	}
 
 	return aclNodeIdentities
+}
+
+func getEntityPolicies(metadata, entityID string, sysView logical.SystemView) ([]string, error) {
+	entity, err := sysView.EntityInfo(entityID)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		return nil, fmt.Errorf("no entity found")
+	}
+
+	groups, err := sysView.GroupsForEntity(entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	mapPolicies := make(map[string]struct{})
+
+	if value, ok := entity.Metadata[metadata]; ok {
+		for _, gp := range strings.Split(value, ",") {
+			mapPolicies[gp] = struct{}{}
+		}
+	}
+
+	for _, g := range groups {
+		if value, ok := g.Metadata[metadata]; ok {
+			for _, gp := range strings.Split(value, ",") {
+				mapPolicies[gp] = struct{}{}
+			}
+		}
+	}
+
+	policies := make([]string, 0, len(mapPolicies))
+	for policy := range mapPolicies {
+		policies = append(policies, policy)
+	}
+	return policies, nil
+}
+
+func pathTokenByAccessor(b *backend) *framework.Path {
+	return &framework.Path{
+		Pattern: "token/" + framework.GenericNameRegex("accessor"),
+
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixConsul,
+			OperationVerb:   "read",
+			OperationSuffix: "token",
+		},
+
+		Fields: map[string]*framework.FieldSchema{
+			"accessor": {
+				Type:        framework.TypeString,
+				Description: "Accessor ID",
+			},
+		},
+
+		Callbacks: map[logical.Operation]framework.OperationFunc{
+			logical.ReadOperation: b.pathTokenByAccessorRead,
+		},
+	}
+}
+
+func (b *backend) pathTokenByAccessorRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	accessor := d.Get("accessor").(string)
+
+	// Get the consul client
+	c, userErr, intErr := b.client(ctx, req.Storage)
+	if intErr != nil {
+		return nil, intErr
+	}
+	if userErr != nil {
+		return logical.ErrorResponse(userErr.Error()), nil
+	}
+
+	opts := &api.QueryOptions{}
+	opts = opts.WithContext(ctx)
+
+	token, _, err := c.ACL().TokenRead(accessor, opts)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
+	resp := &logical.Response{
+		Data: map[string]interface{}{
+			"token":            token.SecretID,
+			"accessor":         token.AccessorID,
+			"local":            token.Local,
+			"consul_namespace": token.Namespace,
+			"partition":        token.Partition,
+		},
+	}
+	return resp, nil
 }

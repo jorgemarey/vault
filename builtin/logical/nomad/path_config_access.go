@@ -164,7 +164,7 @@ func (b *backend) pathConfigAccessWrite(ctx context.Context, req *logical.Reques
 	}
 
 	if conf.Token == "" {
-		client, err := clientFromConfig(conf)
+		client, err := clientFromConfig(conf, "")
 		if err != nil {
 			return logical.ErrorResponse("Token not provided and failed to constuct client"), err
 		}

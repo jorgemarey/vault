@@ -6,6 +6,7 @@ package nomad
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/nomad/api"
@@ -82,11 +83,18 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 		tokenName = tokenName[:tokenNameLength]
 	}
 
+	policies := role.Policies
+	if role.PoliciesFromEntityMetadata != "" && req.EntityID != "" {
+		if p, err := getEntityPolicies(role.PoliciesFromEntityMetadata, req.EntityID, b.System()); err == nil {
+			policies = append(policies, p...)
+		}
+	}
+
 	// Create it
 	token, _, err := c.ACLTokens().Create(&api.ACLToken{
 		Name:     tokenName,
 		Type:     role.TokenType,
-		Policies: role.Policies,
+		Policies: policies,
 		Global:   role.Global,
 	}, nil)
 	if err != nil {
@@ -104,4 +112,41 @@ func (b *backend) pathTokenRead(ctx context.Context, req *logical.Request, d *fr
 	resp.Secret.MaxTTL = leaseConfig.MaxTTL
 
 	return resp, nil
+}
+
+func getEntityPolicies(metadata, entityID string, sysView logical.SystemView) ([]string, error) {
+	entity, err := sysView.EntityInfo(entityID)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		return nil, fmt.Errorf("no entity found")
+	}
+
+	groups, err := sysView.GroupsForEntity(entityID)
+	if err != nil {
+		return nil, err
+	}
+
+	mapPolicies := make(map[string]struct{})
+
+	if value, ok := entity.Metadata[metadata]; ok {
+		for _, gp := range strings.Split(value, ",") {
+			mapPolicies[gp] = struct{}{}
+		}
+	}
+
+	for _, g := range groups {
+		if value, ok := g.Metadata[metadata]; ok {
+			for _, gp := range strings.Split(value, ",") {
+				mapPolicies[gp] = struct{}{}
+			}
+		}
+	}
+
+	policies := make([]string, 0, len(mapPolicies))
+	for policy := range mapPolicies {
+		policies = append(policies, policy)
+	}
+	return policies, nil
 }

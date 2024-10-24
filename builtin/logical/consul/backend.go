@@ -37,6 +37,10 @@ func Backend() *backend {
 			pathListRoles(&b),
 			pathRoles(&b),
 			pathToken(&b),
+			pathKeyring(&b),
+			pathKeyringReload(&b),
+			pathKeyringRotate(&b),
+			pathTokenByAccessor(&b),
 		},
 
 		Secrets: []*framework.Secret{

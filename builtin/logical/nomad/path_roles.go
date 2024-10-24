@@ -42,6 +42,11 @@ func pathRoles(b *backend) *framework.Path {
 				Description: "Name of the role",
 			},
 
+			"policies_from_entity_metadata": {
+				Type:        framework.TypeString,
+				Description: "Metadata value from which to get the policies",
+			},
+
 			"policies": {
 				Type:        framework.TypeCommaStringSlice,
 				Description: "Comma-separated string or list of policies as previously created in Nomad. Required for 'client' token.",
@@ -130,6 +135,8 @@ func (b *backend) pathRolesRead(ctx context.Context, req *logical.Request, d *fr
 			"type":     role.TokenType,
 			"global":   role.Global,
 			"policies": role.Policies,
+
+			"policies_from_entity_metadata": role.PoliciesFromEntityMetadata,
 		},
 	}
 	return resp, nil
@@ -149,6 +156,11 @@ func (b *backend) pathRolesWrite(ctx context.Context, req *logical.Request, d *f
 	policies, ok := d.GetOk("policies")
 	if ok {
 		role.Policies = policies.([]string)
+	}
+
+	policiesFromEntity, ok := d.GetOk("policies_from_entity_metadata")
+	if ok {
+		role.PoliciesFromEntityMetadata = policiesFromEntity.(string)
 	}
 
 	role.TokenType = d.Get("type").(string)
@@ -197,4 +209,6 @@ type roleConfig struct {
 	Policies  []string `json:"policies"`
 	TokenType string   `json:"type"`
 	Global    bool     `json:"global"`
+
+	PoliciesFromEntityMetadata string `json:"policies_from_entity_metadata"`
 }
